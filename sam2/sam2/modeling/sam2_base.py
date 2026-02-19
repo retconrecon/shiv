@@ -664,9 +664,12 @@ class SAM2Base(torch.nn.Module):
                 valid_indices = [] 
                 if frame_idx > 1:  # Ensure we have previous frames to evaluate
                     for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
-                        iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
-                        obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
-                        kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
+                        frame_out = output_dict["non_cond_frame_outputs"].get(i)
+                        if frame_out is None:
+                            continue  # Frame may have been purged (e.g. Cross-Object Interaction)
+                        iou_score = frame_out["best_iou_score"]  # Get mask affinity score
+                        obj_score = frame_out["object_score_logits"]  # Get object score
+                        kf_score = frame_out.get("kf_score")  # Get motion score if available
                         # Check if the scores meet the criteria for being a valid index
                         if iou_score.item() > self.memory_bank_iou_threshold and \
                            obj_score.item() > self.memory_bank_obj_score_threshold and \
