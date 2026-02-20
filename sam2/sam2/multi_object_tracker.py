@@ -29,8 +29,11 @@ Usage:
 """
 
 import gc
+import os
+import os.path as osp
 from typing import Dict, Generator, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
 
@@ -121,6 +124,32 @@ def _get_scores_dict(current_out: dict) -> Dict[str, float]:
         "obj": _to_float(current_out.get("object_score_logits")),
         "kf": _to_float(current_out.get("kf_score")),
     }
+
+
+def _bake_composite(frame_bgr: np.ndarray, masks: dict, obj_ids: list) -> np.ndarray:
+    """Burn colored mask overlays onto a BGR video frame. Returns RGB uint8."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    out = rgb.astype(np.float32)
+    h, w = rgb.shape[:2]
+    colors = [
+        (255, 50, 50),    # red
+        (50, 130, 255),   # blue
+        (50, 255, 80),    # green
+        (255, 200, 0),    # yellow
+        (255, 50, 255),   # magenta
+        (0, 255, 255),    # cyan
+    ]
+    alpha = 0.45
+    for i, oid in enumerate(obj_ids):
+        mask_logits = masks.get(oid)
+        if mask_logits is None:
+            continue
+        binary = mask_logits > 0.0
+        clr = colors[i % len(colors)]
+        overlay = np.zeros((h, w, 3), dtype=np.float32)
+        overlay[binary] = clr
+        out[binary] = out[binary] * (1 - alpha) + overlay[binary] * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def _get_kf_state(predictor) -> Optional[np.ndarray]:
@@ -226,6 +255,13 @@ class MultiObjectTracker:
 
         if capture_diagnostics:
             self.diagnostics = []
+            # Pre-load sorted frame file paths for baking composites
+            _exts = (".jpg", ".jpeg", ".png", ".bmp")
+            _frame_files = sorted([
+                osp.join(video_dir, f)
+                for f in os.listdir(video_dir)
+                if f.lower().endswith(_exts)
+            ])
 
         # Build N independent predictors
         predictors = {}
@@ -322,8 +358,15 @@ class MultiObjectTracker:
 
                 # --- Capture diagnostics ---
                 if capture_diagnostics:
+                    # Bake video frame + mask overlays into a self-contained composite
+                    frame_bgr = cv2.imread(_frame_files[current_frame_idx])
+                    composite = _bake_composite(
+                        frame_bgr, frame_masks, obj_ids,
+                    ) if frame_bgr is not None else None
+
                     diag_entry = {
                         "frame_idx": current_frame_idx,
+                        "composite": composite,
                         "masks": {oid: frame_masks[oid].copy() for oid in active_ids},
                         "scores": {
                             oid: _get_scores_dict(frame_outputs[oid])

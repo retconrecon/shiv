@@ -9,8 +9,13 @@ Requires Python >= 3.10 with fastplotlib installed from:
 Usage:
     from sam2.diagnostics import DiagnosticViewer, load_diagnostics
 
+    # Self-contained mode (baked composites, no video_dir needed):
     diag = load_diagnostics("diag.npz")
-    viewer = DiagnosticViewer("path/to/video/frames", diag)
+    viewer = DiagnosticViewer(diag)
+    viewer.show()
+
+    # Or with original video frames:
+    viewer = DiagnosticViewer(diag, video_dir="path/to/video/frames")
     viewer.show()
 
     # Keyboard controls:
@@ -54,6 +59,7 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
             "kf_states": {},
             "pairwise_ious": entry["pairwise_ious"],
             "purge_events": entry["purge_events"],
+            "has_composite": False,
         }
         for oid, mask in entry["masks"].items():
             arrays[f"mask_{fidx}_{oid}"] = mask
@@ -63,6 +69,11 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
                 frame_meta["kf_states"][str(oid)] = True
             else:
                 frame_meta["kf_states"][str(oid)] = False
+        # Baked composite (video frame + mask overlays, RGB uint8)
+        composite = entry.get("composite")
+        if composite is not None:
+            arrays[f"composite_{fidx}"] = composite
+            frame_meta["has_composite"] = True
         meta_frames.append(frame_meta)
 
     arrays["__meta__"] = np.array([0])  # placeholder
@@ -99,6 +110,7 @@ def load_diagnostics(path: str) -> list:
             "kf_states": {},
             "pairwise_ious": frame_meta["pairwise_ious"],
             "purge_events": frame_meta["purge_events"],
+            "composite": None,
         }
         for key in data.files:
             if key.startswith(f"mask_{fidx}_"):
@@ -110,6 +122,11 @@ def load_diagnostics(path: str) -> list:
                 entry["kf_states"][oid] = data[f"kf_{fidx}_{oid}"]
             else:
                 entry["kf_states"][oid] = None
+        # Load baked composite if present
+        if frame_meta.get("has_composite", False):
+            composite_key = f"composite_{fidx}"
+            if composite_key in data:
+                entry["composite"] = data[composite_key]
 
         diagnostics.append(entry)
 
@@ -183,25 +200,37 @@ class DiagnosticViewer:
 
     Parameters
     ----------
-    video_dir : str
-        Path to directory containing video frames.
+    video_dir : str or None
+        Path to directory containing video frames. Can be None if diagnostic
+        data contains baked composites (captured with capture_diagnostics=True).
     diagnostics : list
         Diagnostic data from MultiObjectTracker (or loaded via load_diagnostics).
     preload_frames : bool
         If True, load all video frames into memory at init.
         If False, load frames on demand (slower scrubbing but less memory).
+        Ignored when video_dir is None (composites are used instead).
     """
 
     def __init__(
         self,
-        video_dir: str,
         diagnostics: list,
+        video_dir: Optional[str] = None,
         preload_frames: bool = True,
     ):
         self.video_dir = video_dir
         self.diagnostics = diagnostics
         self.n_frames = len(diagnostics)
         self._current_idx = 0
+
+        # Check if baked composites are available
+        self._has_composites = diagnostics[0].get("composite") is not None
+
+        if not self._has_composites and video_dir is None:
+            raise ValueError(
+                "video_dir is required when diagnostic data does not contain "
+                "baked composites. Re-run tracking with capture_diagnostics=True "
+                "to bake composites into the diagnostic files."
+            )
 
         # Extract object IDs from first frame
         self.obj_ids = sorted(diagnostics[0]["masks"].keys())
@@ -216,16 +245,17 @@ class DiagnosticViewer:
         # Precompute timelines
         self._build_timelines()
 
-        # Load video frames
-        if preload_frames:
-            self._frames = _load_video_frames(video_dir)
-        else:
-            self._frames = None
-            self._frame_files = sorted([
-                osp.join(video_dir, f)
-                for f in os.listdir(video_dir)
-                if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
-            ])
+        # Load video frames (only needed when no baked composites)
+        self._frames = None
+        if not self._has_composites and video_dir is not None:
+            if preload_frames:
+                self._frames = _load_video_frames(video_dir)
+            else:
+                self._frame_files = sorted([
+                    osp.join(video_dir, f)
+                    for f in os.listdir(video_dir)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+                ])
 
     def _build_timelines(self):
         """Pre-extract score and IoU arrays for timeline plots."""
@@ -287,8 +317,11 @@ class DiagnosticViewer:
 
     def _get_composite(self, idx: int) -> np.ndarray:
         """Get video frame with mask overlays composited."""
-        frame = self._get_frame(idx)
         entry = self.diagnostics[idx]
+        # Use baked composite if available (self-contained mode)
+        if self._has_composites and entry.get("composite") is not None:
+            return entry["composite"]
+        frame = self._get_frame(idx)
         return _make_mask_overlay(frame, entry["masks"], self.obj_ids)
 
     def show(self):
