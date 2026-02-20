@@ -23,6 +23,9 @@ Usage:
         # masks: dict  {obj_id: np.ndarray}  float32 logits, full resolution
         # purge_events: list of dicts describing any CoI purges this frame
         ...
+
+    # If capture_diagnostics=True was passed to track():
+    mot.save_diagnostics("diag.npz")
 """
 
 import gc
@@ -32,7 +35,12 @@ import numpy as np
 import torch
 
 from sam2.build_sam import build_sam2_video_predictor
+from sam2.diagnostics import save_diagnostics, load_diagnostics
 
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 
 def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """Compute IoU between two boolean masks of identical shape."""
@@ -41,6 +49,24 @@ def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     if union == 0:
         return 0.0
     return float(intersection / union)
+
+
+def mask_centroid(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    """Return (cx, cy) centroid of a boolean mask, or None if empty."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def mask_bbox(mask: np.ndarray) -> List[int]:
+    """Return [x, y, w, h] bounding box of a boolean mask."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return [0, 0, 0, 0]
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    return [x_min, y_min, x_max - x_min, y_max - y_min]
 
 
 def _purge_memory(inference_state: dict, frame_idx: int) -> int:
@@ -53,11 +79,9 @@ def _purge_memory(inference_state: dict, frame_idx: int) -> int:
     removed = 0
     output_dict = inference_state["output_dict"]
 
-    # Purge from packed (batched) output dict
     if output_dict["non_cond_frame_outputs"].pop(frame_idx, None) is not None:
         removed += 1
 
-    # Purge from per-object output dict slices
     for obj_idx, obj_output_dict in inference_state["output_dict_per_obj"].items():
         if obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None) is not None:
             removed += 1
@@ -75,15 +99,46 @@ def _get_score(current_out: dict) -> float:
     iou_score = current_out.get("best_iou_score")
     obj_score = current_out.get("object_score_logits")
 
-    # best_iou_score is preferred; fall back to object_score_logits
     score = iou_score if iou_score is not None else obj_score
     if score is None:
         return 0.0
     if isinstance(score, (int, float)):
         return float(score)
-    # Tensor — may be on GPU
     return float(score.item())
 
+
+def _get_scores_dict(current_out: dict) -> Dict[str, float]:
+    """Extract all three score components as a dict."""
+    def _to_float(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return float(v.item())
+
+    return {
+        "iou": _to_float(current_out.get("best_iou_score")),
+        "obj": _to_float(current_out.get("object_score_logits")),
+        "kf": _to_float(current_out.get("kf_score")),
+    }
+
+
+def _get_kf_state(predictor) -> Optional[np.ndarray]:
+    """
+    Get the Kalman Filter state [cx, cy, aspect, height, vx, vy, va, vh]
+    from a SAMURAI predictor. Returns None if KF not yet initialized.
+    """
+    if predictor.kf_mean is None:
+        return None
+    mean = predictor.kf_mean
+    if isinstance(mean, np.ndarray):
+        return mean.copy()
+    return np.array(mean)
+
+
+# ---------------------------------------------------------------------------
+# MultiObjectTracker
+# ---------------------------------------------------------------------------
 
 class MultiObjectTracker:
     """
@@ -118,6 +173,7 @@ class MultiObjectTracker:
         self.ckpt_path = ckpt_path
         self.device = device
         self.apply_postprocessing = apply_postprocessing
+        self.diagnostics = []
 
     def track(
         self,
@@ -126,6 +182,7 @@ class MultiObjectTracker:
         offload_video_to_cpu: bool = True,
         offload_state_to_cpu: bool = True,
         iou_threshold: float = 0.8,
+        capture_diagnostics: bool = False,
     ) -> Generator[Tuple[int, Dict[int, np.ndarray], List[dict]], None, None]:
         """
         Run lockstep multi-object tracking with Cross-Object Interaction.
@@ -142,6 +199,9 @@ class MultiObjectTracker:
             Offload inference state tensors to CPU between frames.
         iou_threshold : float
             Pairwise mask IoU above which Cross-Object Interaction triggers.
+        capture_diagnostics : bool
+            If True, store per-frame diagnostic data in self.diagnostics.
+            Access after generator exhaustion, or call self.save_diagnostics().
 
         Yields
         ------
@@ -163,6 +223,9 @@ class MultiObjectTracker:
         n_objects = len(obj_ids)
         if n_objects == 0:
             return
+
+        if capture_diagnostics:
+            self.diagnostics = []
 
         # Build N independent predictors
         predictors = {}
@@ -207,11 +270,9 @@ class MultiObjectTracker:
                         continue
 
                     current_frame_idx = frame_idx
-                    # video_res_masks: (1, 1, H, W) tensor — one object per predictor
                     mask_logits = video_res_masks[0, 0].cpu().numpy().astype(np.float32)
                     frame_masks[oid] = mask_logits
 
-                    # Grab the current output for scoring
                     out_dict = states[oid]["output_dict"]
                     current_out = out_dict["non_cond_frame_outputs"].get(frame_idx)
                     if current_out is None:
@@ -219,23 +280,25 @@ class MultiObjectTracker:
                     frame_outputs[oid] = current_out
 
                 if not frame_masks:
-                    break  # All generators exhausted
+                    break
 
                 # --- Cross-Object Interaction ---
                 purge_events = []
                 active_ids = list(frame_masks.keys())
+                bool_masks = {oid: frame_masks[oid] > 0.0 for oid in active_ids}
+                pairwise_ious = {}
+
                 for i in range(len(active_ids)):
                     for j in range(i + 1, len(active_ids)):
                         oid_a = active_ids[i]
                         oid_b = active_ids[j]
-                        mask_a = frame_masks[oid_a] > 0.0
-                        mask_b = frame_masks[oid_b] > 0.0
 
-                        iou = mask_iou(mask_a, mask_b)
+                        iou = mask_iou(bool_masks[oid_a], bool_masks[oid_b])
+                        pairwise_ious[(oid_a, oid_b)] = iou
+
                         if iou <= iou_threshold:
                             continue
 
-                        # Collision detected — purge the lower-scoring tracker
                         score_a = _get_score(frame_outputs[oid_a])
                         score_b = _get_score(frame_outputs[oid_b])
 
@@ -257,6 +320,35 @@ class MultiObjectTracker:
                             "purged": n_purged,
                         })
 
+                # --- Capture diagnostics ---
+                if capture_diagnostics:
+                    diag_entry = {
+                        "frame_idx": current_frame_idx,
+                        "masks": {oid: frame_masks[oid].copy() for oid in active_ids},
+                        "scores": {
+                            oid: _get_scores_dict(frame_outputs[oid])
+                            for oid in active_ids
+                        },
+                        "centroids": {
+                            oid: mask_centroid(bool_masks[oid])
+                            for oid in active_ids
+                        },
+                        "bboxes": {
+                            oid: mask_bbox(bool_masks[oid])
+                            for oid in active_ids
+                        },
+                        "kf_states": {
+                            oid: _get_kf_state(predictors[oid])
+                            for oid in active_ids
+                        },
+                        "pairwise_ious": {
+                            f"{a},{b}": v
+                            for (a, b), v in pairwise_ious.items()
+                        },
+                        "purge_events": purge_events,
+                    }
+                    self.diagnostics.append(diag_entry)
+
                 yield current_frame_idx, frame_masks, purge_events
 
         # Cleanup
@@ -266,3 +358,9 @@ class MultiObjectTracker:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def save_diagnostics(self, path: str) -> None:
+        """Save captured diagnostics to disk. Requires capture_diagnostics=True."""
+        if not self.diagnostics:
+            raise ValueError("No diagnostics captured. Run track() with capture_diagnostics=True first.")
+        save_diagnostics(self.diagnostics, path)
