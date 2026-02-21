@@ -29,9 +29,10 @@ Usage:
 """
 
 import gc
+import logging
 import os
 import os.path as osp
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Callable, Dict, Generator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -212,6 +213,8 @@ class MultiObjectTracker:
         offload_state_to_cpu: bool = True,
         iou_threshold: float = 0.8,
         capture_diagnostics: bool = False,
+        health_check: Optional[Callable] = None,
+        health_check_interval: int = 30,
     ) -> Generator[Tuple[int, Dict[int, np.ndarray], List[dict]], None, None]:
         """
         Run lockstep multi-object tracking with Cross-Object Interaction.
@@ -231,6 +234,15 @@ class MultiObjectTracker:
         capture_diagnostics : bool
             If True, store per-frame diagnostic data in self.diagnostics.
             Access after generator exhaustion, or call self.save_diagnostics().
+        health_check : callable, optional
+            ``Callable(frame_idx, masks, scores) -> dict[int, list]``.
+            Called every *health_check_interval* frames with the current
+            frame index, mask dict ``{obj_id: np.ndarray}``, and score dict
+            ``{obj_id: float}``.  Returns ``{obj_id: [x1, y1, x2, y2]}``
+            for any trackers that should be re-initialized with a new
+            bounding box.  Return ``{}`` when all trackers are healthy.
+        health_check_interval : int
+            Run the health check every N frames (default 30).
 
         Yields
         ------
@@ -252,6 +264,8 @@ class MultiObjectTracker:
         n_objects = len(obj_ids)
         if n_objects == 0:
             return
+
+        self.reinit_events = []
 
         if capture_diagnostics:
             self.diagnostics = []
@@ -291,10 +305,12 @@ class MultiObjectTracker:
 
             # Step all generators in lockstep
             exhausted = set()
-            while True:
+            try:
+              while True:
                 frame_masks = {}    # {obj_id: np.ndarray} float32 logits
                 frame_outputs = {}  # {obj_id: current_out dict} for scoring
                 current_frame_idx = None
+                yielded_frame_idxs = {}
 
                 for oid in obj_ids:
                     if oid in exhausted:
@@ -304,7 +320,19 @@ class MultiObjectTracker:
                     except StopIteration:
                         exhausted.add(oid)
                         continue
+                    except Exception as e:
+                        logging.error(
+                            "Tracker oid=%d failed: %s: %s. Marking exhausted.",
+                            oid, type(e).__name__, e,
+                        )
+                        exhausted.add(oid)
+                        try:
+                            generators[oid].close()
+                        except Exception:
+                            pass
+                        continue
 
+                    yielded_frame_idxs[oid] = frame_idx
                     current_frame_idx = frame_idx
                     mask_logits = video_res_masks[0, 0].cpu().numpy().astype(np.float32)
                     frame_masks[oid] = mask_logits
@@ -317,6 +345,21 @@ class MultiObjectTracker:
 
                 if not frame_masks:
                     break
+
+                # Partial exhaustion: some generators done while others active
+                if exhausted and frame_masks:
+                    logging.warning(
+                        "Partial exhaustion: exhausted=%s, active=%s",
+                        exhausted, set(frame_masks.keys()),
+                    )
+
+                # Lockstep invariant: all generators must yield the same frame_idx
+                if len(yielded_frame_idxs) > 1:
+                    unique_frames = set(yielded_frame_idxs.values())
+                    assert len(unique_frames) == 1, (
+                        f"LOCKSTEP VIOLATION: generators yielded different "
+                        f"frame_idxs: {yielded_frame_idxs}"
+                    )
 
                 # --- Cross-Object Interaction ---
                 purge_events = []
@@ -356,6 +399,103 @@ class MultiObjectTracker:
                             "purged": n_purged,
                         })
 
+                # Snapshot KF states before re-init may swap predictors
+                pre_reinit_kf = {
+                    oid: _get_kf_state(predictors[oid])
+                    for oid in active_ids
+                }
+
+                # --- Health check & re-initialization ---
+                reinit_events = []
+                if (health_check is not None
+                        and current_frame_idx > 0
+                        and current_frame_idx % health_check_interval == 0):
+                    try:
+                        reinit_boxes = health_check(
+                            current_frame_idx,
+                            frame_masks,
+                            {oid: _get_score(frame_outputs[oid])
+                             for oid in active_ids},
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            "Health check raised %s at frame %d: %s. "
+                            "Skipping re-init.",
+                            type(e).__name__, current_frame_idx, e,
+                        )
+                        reinit_boxes = {}
+
+                    if reinit_boxes is None:
+                        reinit_boxes = {}
+
+                    # Skip re-init near end of video (wasteful checkpoint load)
+                    num_frames = next(iter(states.values()))["num_frames"]
+
+                    for oid, box in reinit_boxes.items():
+                        if oid not in predictors:
+                            logging.warning(
+                                "Health check returned unknown oid=%d. "
+                                "Skipping.", oid,
+                            )
+                            continue
+
+                        if current_frame_idx >= num_frames - 2:
+                            continue
+
+                        try:
+                            # BUILD PHASE — old predictor untouched
+                            new_pred = build_sam2_video_predictor(
+                                self.config_file, self.ckpt_path,
+                                device=self.device,
+                                apply_postprocessing=self.apply_postprocessing,
+                            )
+                            new_state = new_pred.init_state(
+                                video_dir,
+                                offload_video_to_cpu=offload_video_to_cpu,
+                                offload_state_to_cpu=offload_state_to_cpu,
+                            )
+                            new_pred.add_new_points_or_box(
+                                new_state, box=box,
+                                frame_idx=current_frame_idx, obj_id=0,
+                            )
+                            new_gen = new_pred.propagate_in_video(
+                                new_state,
+                                start_frame_idx=current_frame_idx + 1,
+                            )
+
+                            # COMMIT PHASE — atomic swap
+                            old_gen = generators[oid]
+                            predictors[oid] = new_pred
+                            states[oid] = new_state
+                            generators[oid] = new_gen
+                            if oid in exhausted:
+                                exhausted.discard(oid)
+
+                            # CLEANUP PHASE — release old resources
+                            old_gen.close()
+                            del old_gen
+                            gc.collect()
+                            torch.cuda.empty_cache()
+
+                            reinit_events.append({
+                                "frame_idx": current_frame_idx,
+                                "obj_id": oid,
+                                "box": list(box),
+                            })
+
+                        except Exception as e:
+                            logging.error(
+                                "Re-init failed for oid=%d at frame %d: "
+                                "%s: %s. Old tracker continues.",
+                                oid, current_frame_idx,
+                                type(e).__name__, e,
+                            )
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            continue
+
+                self.reinit_events.extend(reinit_events)
+
                 # --- Capture diagnostics ---
                 if capture_diagnostics:
                     # Bake video frame + mask overlays into a self-contained composite
@@ -380,7 +520,7 @@ class MultiObjectTracker:
                             for oid in active_ids
                         },
                         "kf_states": {
-                            oid: _get_kf_state(predictors[oid])
+                            oid: pre_reinit_kf[oid]
                             for oid in active_ids
                         },
                         "pairwise_ious": {
@@ -388,18 +528,25 @@ class MultiObjectTracker:
                             for (a, b), v in pairwise_ious.items()
                         },
                         "purge_events": purge_events,
+                        "reinit_events": reinit_events,
+                        "yielded_frame_idxs": dict(yielded_frame_idxs),
                     }
                     self.diagnostics.append(diag_entry)
 
                 yield current_frame_idx, frame_masks, purge_events
 
-        # Cleanup
-        for oid in obj_ids:
-            del predictors[oid]
-            del states[oid]
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            finally:
+                for oid in list(generators.keys()):
+                    try:
+                        generators[oid].close()
+                    except Exception:
+                        pass
+                predictors.clear()
+                states.clear()
+                generators.clear()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def save_diagnostics(self, path: str) -> None:
         """Save captured diagnostics to disk. Requires capture_diagnostics=True."""

@@ -24,6 +24,7 @@ Usage:
     #   Shift+Right      — jump 10 frames forward
     #   Shift+Left       — jump 10 frames backward
     #   p                — jump to next purge event
+    #   r                — jump to next reinit event
 """
 
 import json
@@ -57,6 +58,8 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
             "kf_states": {},
             "pairwise_ious": entry["pairwise_ious"],
             "purge_events": entry["purge_events"],
+            "reinit_events": entry.get("reinit_events", []),
+            "yielded_frame_idxs": entry.get("yielded_frame_idxs", {}),
             "has_composite": False,
         }
         for oid, kf in entry["kf_states"].items():
@@ -105,6 +108,11 @@ def load_diagnostics(path: str) -> list:
             "kf_states": {},
             "pairwise_ious": frame_meta["pairwise_ious"],
             "purge_events": frame_meta["purge_events"],
+            "reinit_events": frame_meta.get("reinit_events", []),
+            "yielded_frame_idxs": {
+                int(k): v
+                for k, v in frame_meta.get("yielded_frame_idxs", {}).items()
+            },
             "composite": None,
         }
         for oid_str, has_kf in frame_meta["kf_states"].items():
@@ -126,6 +134,7 @@ def load_diagnostics(path: str) -> list:
 
 # Object colors: visually distinct, alpha-friendly
 PURGE_COLOR = "red"
+REINIT_COLOR = "lime"
 INDICATOR_COLOR = "yellow"
 
 
@@ -166,6 +175,12 @@ class DiagnosticViewer:
         for entry in diagnostics:
             if entry["purge_events"]:
                 self.purge_frames.append(entry["frame_idx"])
+
+        # Find reinit frames for quick navigation
+        self.reinit_frames = []
+        for entry in diagnostics:
+            if entry.get("reinit_events"):
+                self.reinit_frames.append(entry["frame_idx"])
 
         # Precompute timelines
         self._build_timelines()
@@ -331,6 +346,18 @@ class DiagnosticViewer:
                 name="purge_markers",
             )
 
+        # Reinit event markers
+        if self.reinit_frames:
+            reinit_x = np.array(self.reinit_frames, dtype=np.float32)
+            reinit_y = np.ones_like(reinit_x) * 0.7
+            fig["iou"].add_scatter(
+                np.column_stack([reinit_x, reinit_y, np.zeros_like(reinit_x)]),
+                colors=REINIT_COLOR,
+                sizes=15,
+                markers="^",
+                name="reinit_markers",
+            )
+
         # Frame indicator on IoU
         iou_indicator = fig["iou"].add_line(
             np.array([[0, 0, 0], [0, 1, 0]], dtype=np.float32),
@@ -390,7 +417,11 @@ class DiagnosticViewer:
             if entry["purge_events"]:
                 victims = [str(e["purged_obj"]) for e in entry["purge_events"]]
                 purge_note = f"  PURGE: obj {','.join(victims)}"
-            frame_text.text = f"Frame: {new_idx} / {self.n_frames - 1}{purge_note}"
+            reinit_note = ""
+            if entry.get("reinit_events"):
+                objs = ", ".join([str(e["obj_id"]) for e in entry["reinit_events"]])
+                reinit_note = f"  REINIT obj {objs}"
+            frame_text.text = f"Frame: {new_idx} / {self.n_frames - 1}{purge_note}{reinit_note}"
 
             # Update indicator lines on timelines
             fx = float(new_idx)
@@ -426,6 +457,15 @@ class DiagnosticViewer:
                 # Wrap around
                 if self.purge_frames:
                     _update_display(self.purge_frames[0])
+            elif key == "r":
+                # Jump to next reinit event
+                for rf in self.reinit_frames:
+                    if rf > idx:
+                        _update_display(rf)
+                        return
+                # Wrap around
+                if self.reinit_frames:
+                    _update_display(self.reinit_frames[0])
 
         # Register keyboard handler
         fig.renderer.add_event_handler(_on_key, "key_down")
@@ -504,6 +544,12 @@ class DiagnosticViewer:
                 np.array([[pf, -0.05, 0], [pf, 1.05, 0]], dtype=np.float32),
                 colors="red", thickness=1,
             )
+        # Reinit marker lines on score panel
+        for rf in self.reinit_frames:
+            fig["scores"].add_line(
+                np.array([[rf, -0.05, 0], [rf, 1.05, 0]], dtype=np.float32),
+                colors=REINIT_COLOR, thickness=1,
+            )
 
         self._r_score_indicator = fig["scores"].add_line(
             np.array([[0, -0.05, 0], [0, 1.05, 0]], dtype=np.float32),
@@ -539,6 +585,19 @@ class DiagnosticViewer:
                     colors="red", thickness=1,
                 )
 
+        # Reinit markers
+        if self.reinit_frames:
+            reinit_x = np.array(self.reinit_frames, dtype=np.float32)
+            fig["iou"].add_scatter(
+                np.column_stack([reinit_x, np.full_like(reinit_x, 0.7), np.zeros_like(reinit_x)]),
+                colors=REINIT_COLOR, sizes=12, markers="^", name="reinit_markers",
+            )
+            for rf in self.reinit_frames:
+                fig["iou"].add_line(
+                    np.array([[rf, -0.05, 0], [rf, 1.05, 0]], dtype=np.float32),
+                    colors=REINIT_COLOR, thickness=1,
+                )
+
         self._r_iou_indicator = fig["iou"].add_line(
             np.array([[0, -0.05, 0], [0, 1.05, 0]], dtype=np.float32),
             colors="yellow", thickness=2, name="iou_indicator",
@@ -562,6 +621,11 @@ class DiagnosticViewer:
             fig["kf_residual"].add_line(
                 np.array([[pf, 0, 0], [pf, kf_max, 0]], dtype=np.float32),
                 colors="red", thickness=1,
+            )
+        for rf in self.reinit_frames:
+            fig["kf_residual"].add_line(
+                np.array([[rf, 0, 0], [rf, kf_max, 0]], dtype=np.float32),
+                colors=REINIT_COLOR, thickness=1,
             )
 
         self._r_kf_indicator = fig["kf_residual"].add_line(
@@ -599,7 +663,11 @@ class DiagnosticViewer:
             victims = ", ".join([str(e["purged_obj"]) for e in entry["purge_events"]])
             ious = ", ".join([f'{e.get("iou", 0):.3f}' for e in entry["purge_events"]])
             purge_note = f"  PURGE obj {victims} (IoU: {ious})"
-        self._r_frame_text.text = f"Frame {idx} / {self.n_frames - 1}{purge_note}"
+        reinit_note = ""
+        if entry.get("reinit_events"):
+            objs = ", ".join([str(e["obj_id"]) for e in entry["reinit_events"]])
+            reinit_note = f"  REINIT obj {objs}"
+        self._r_frame_text.text = f"Frame {idx} / {self.n_frames - 1}{purge_note}{reinit_note}"
 
         # Frame indicators on timelines
         self._r_score_indicator.data = np.array(
