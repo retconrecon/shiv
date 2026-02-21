@@ -367,7 +367,6 @@ class MultiObjectTracker:
                     diag_entry = {
                         "frame_idx": current_frame_idx,
                         "composite": composite,
-                        "masks": {oid: frame_masks[oid].copy() for oid in active_ids},
                         "scores": {
                             oid: _get_scores_dict(frame_outputs[oid])
                             for oid in active_ids

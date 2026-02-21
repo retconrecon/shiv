@@ -29,9 +29,7 @@ Usage:
 import json
 import os
 import os.path as osp
-from typing import Optional
 
-import cv2
 import numpy as np
 
 
@@ -61,8 +59,6 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
             "purge_events": entry["purge_events"],
             "has_composite": False,
         }
-        for oid, mask in entry["masks"].items():
-            arrays[f"mask_{fidx}_{oid}"] = mask
         for oid, kf in entry["kf_states"].items():
             if kf is not None:
                 arrays[f"kf_{fidx}_{oid}"] = kf
@@ -103,7 +99,6 @@ def load_diagnostics(path: str) -> list:
 
         entry = {
             "frame_idx": fidx,
-            "masks": {},
             "scores": scores,
             "centroids": centroids,
             "bboxes": bboxes,
@@ -112,10 +107,6 @@ def load_diagnostics(path: str) -> list:
             "purge_events": frame_meta["purge_events"],
             "composite": None,
         }
-        for key in data.files:
-            if key.startswith(f"mask_{fidx}_"):
-                oid = int(key.split("_")[-1])
-                entry["masks"][oid] = data[key]
         for oid_str, has_kf in frame_meta["kf_states"].items():
             oid = int(oid_str)
             if has_kf:
@@ -134,58 +125,8 @@ def load_diagnostics(path: str) -> list:
 
 
 # Object colors: visually distinct, alpha-friendly
-OBJ_COLORS = [
-    (1.0, 0.2, 0.2, 0.45),   # red
-    (0.2, 0.5, 1.0, 0.45),   # blue
-    (0.2, 1.0, 0.3, 0.45),   # green
-    (1.0, 0.8, 0.0, 0.45),   # yellow
-    (1.0, 0.2, 1.0, 0.45),   # magenta
-    (0.0, 1.0, 1.0, 0.45),   # cyan
-]
-
-KF_COLOR = (1.0, 1.0, 0.0, 0.8)     # yellow for KF predictions
-CENTROID_COLOR = (1.0, 1.0, 1.0, 1.0)  # white for actual centroids
 PURGE_COLOR = "red"
 INDICATOR_COLOR = "yellow"
-
-
-def _load_video_frames(video_dir: str) -> np.ndarray:
-    """Load all frames from a directory of images into an (T, H, W, 3) uint8 array."""
-    exts = (".jpg", ".jpeg", ".png", ".bmp")
-    frame_files = sorted([
-        f for f in os.listdir(video_dir)
-        if f.lower().endswith(exts)
-    ])
-    if not frame_files:
-        raise ValueError(f"No image files found in {video_dir}")
-
-    frames = []
-    for fname in frame_files:
-        img = cv2.imread(osp.join(video_dir, fname))
-        if img is None:
-            continue
-        frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    return np.stack(frames)
-
-
-def _make_mask_overlay(frame: np.ndarray, masks: dict, obj_ids: list) -> np.ndarray:
-    """Composite colored mask overlays onto a video frame. Returns RGB uint8."""
-    out = frame.copy().astype(np.float32)
-    h, w = frame.shape[:2]
-
-    for i, oid in enumerate(obj_ids):
-        mask_logits = masks.get(oid)
-        if mask_logits is None:
-            continue
-        binary = mask_logits > 0.0
-        color = OBJ_COLORS[i % len(OBJ_COLORS)]
-        overlay = np.zeros((h, w, 3), dtype=np.float32)
-        overlay[binary] = [color[0] * 255, color[1] * 255, color[2] * 255]
-        alpha = color[3]
-        out[binary] = out[binary] * (1 - alpha) + overlay[binary] * alpha
-
-    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 class DiagnosticViewer:
@@ -200,40 +141,24 @@ class DiagnosticViewer:
 
     Parameters
     ----------
-    video_dir : str or None
-        Path to directory containing video frames. Can be None if diagnostic
-        data contains baked composites (captured with capture_diagnostics=True).
     diagnostics : list
         Diagnostic data from MultiObjectTracker (or loaded via load_diagnostics).
-    preload_frames : bool
-        If True, load all video frames into memory at init.
-        If False, load frames on demand (slower scrubbing but less memory).
-        Ignored when video_dir is None (composites are used instead).
+        Must contain baked composites (captured with capture_diagnostics=True).
     """
 
-    def __init__(
-        self,
-        diagnostics: list,
-        video_dir: Optional[str] = None,
-        preload_frames: bool = True,
-    ):
-        self.video_dir = video_dir
+    def __init__(self, diagnostics: list):
         self.diagnostics = diagnostics
         self.n_frames = len(diagnostics)
         self._current_idx = 0
 
-        # Check if baked composites are available
-        self._has_composites = diagnostics[0].get("composite") is not None
-
-        if not self._has_composites and video_dir is None:
+        if diagnostics[0].get("composite") is None:
             raise ValueError(
-                "video_dir is required when diagnostic data does not contain "
-                "baked composites. Re-run tracking with capture_diagnostics=True "
-                "to bake composites into the diagnostic files."
+                "Diagnostic data does not contain baked composites. "
+                "Re-run tracking with capture_diagnostics=True."
             )
 
         # Extract object IDs from first frame
-        self.obj_ids = sorted(diagnostics[0]["masks"].keys())
+        self.obj_ids = sorted(diagnostics[0]["scores"].keys())
         self.n_objects = len(self.obj_ids)
 
         # Find purge frames for quick navigation
@@ -244,18 +169,6 @@ class DiagnosticViewer:
 
         # Precompute timelines
         self._build_timelines()
-
-        # Load video frames (only needed when no baked composites)
-        self._frames = None
-        if not self._has_composites and video_dir is not None:
-            if preload_frames:
-                self._frames = _load_video_frames(video_dir)
-            else:
-                self._frame_files = sorted([
-                    osp.join(video_dir, f)
-                    for f in os.listdir(video_dir)
-                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
-                ])
 
     def _build_timelines(self):
         """Pre-extract score and IoU arrays for timeline plots."""
@@ -308,21 +221,9 @@ class DiagnosticViewer:
                 if str_key in pw:
                     self.pairwise_iou_timelines[pair_key][idx] = pw[str_key]
 
-    def _get_frame(self, idx: int) -> np.ndarray:
-        """Get video frame at index."""
-        if self._frames is not None:
-            return self._frames[idx]
-        img = cv2.imread(self._frame_files[idx])
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
     def _get_composite(self, idx: int) -> np.ndarray:
-        """Get video frame with mask overlays composited."""
-        entry = self.diagnostics[idx]
-        # Use baked composite if available (self-contained mode)
-        if self._has_composites and entry.get("composite") is not None:
-            return entry["composite"]
-        frame = self._get_frame(idx)
-        return _make_mask_overlay(frame, entry["masks"], self.obj_ids)
+        """Get baked video frame + mask overlay composite."""
+        return self.diagnostics[idx]["composite"]
 
     def show(self):
         """Build and display the interactive diagnostic viewer."""
