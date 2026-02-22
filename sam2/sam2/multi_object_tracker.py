@@ -235,12 +235,13 @@ class MultiObjectTracker:
             If True, store per-frame diagnostic data in self.diagnostics.
             Access after generator exhaustion, or call self.save_diagnostics().
         health_check : callable, optional
-            ``Callable(frame_idx, masks, scores) -> dict[int, list]``.
+            ``Callable(frame_idx, masks, scores, frame) -> dict[int, list]``.
             Called every *health_check_interval* frames with the current
-            frame index, mask dict ``{obj_id: np.ndarray}``, and score dict
-            ``{obj_id: float}``.  Returns ``{obj_id: [x1, y1, x2, y2]}``
-            for any trackers that should be re-initialized with a new
-            bounding box.  Return ``{}`` when all trackers are healthy.
+            frame index, mask dict ``{obj_id: np.ndarray}``, score dict
+            ``{obj_id: float}``, and BGR video frame ``np.ndarray``.
+            Returns ``{obj_id: [x1, y1, x2, y2]}`` for any trackers that
+            should be re-initialized with a new bounding box.
+            Return ``{}`` when all trackers are healthy.
         health_check_interval : int
             Run the health check every N frames (default 30).
 
@@ -267,15 +268,18 @@ class MultiObjectTracker:
 
         self.reinit_events = []
 
-        if capture_diagnostics:
-            self.diagnostics = []
-            # Pre-load sorted frame file paths for baking composites
+        # Pre-load sorted frame file paths (needed for diagnostics and health check)
+        _frame_files = None
+        if capture_diagnostics or health_check is not None:
             _exts = (".jpg", ".jpeg", ".png", ".bmp")
             _frame_files = sorted([
                 osp.join(video_dir, f)
                 for f in os.listdir(video_dir)
                 if f.lower().endswith(_exts)
             ])
+
+        if capture_diagnostics:
+            self.diagnostics = []
 
         # Build N independent predictors
         predictors = {}
@@ -411,11 +415,13 @@ class MultiObjectTracker:
                         and current_frame_idx > 0
                         and current_frame_idx % health_check_interval == 0):
                     try:
+                        hc_frame = cv2.imread(_frame_files[current_frame_idx])
                         reinit_boxes = health_check(
                             current_frame_idx,
                             frame_masks,
                             {oid: _get_score(frame_outputs[oid])
                              for oid in active_ids},
+                            hc_frame,
                         )
                     except Exception as e:
                         logging.warning(
