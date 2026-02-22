@@ -25,6 +25,7 @@ Usage:
     #   Shift+Left       — jump 10 frames backward
     #   p                — jump to next purge event
     #   r                — jump to next reinit event
+    #   s                — jump to next swap event
 """
 
 import json
@@ -59,6 +60,7 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
             "pairwise_ious": entry["pairwise_ious"],
             "purge_events": entry["purge_events"],
             "reinit_events": entry.get("reinit_events", []),
+            "swap_events": entry.get("swap_events", []),
             "yielded_frame_idxs": entry.get("yielded_frame_idxs", {}),
             "has_composite": False,
         }
@@ -109,6 +111,7 @@ def load_diagnostics(path: str) -> list:
             "pairwise_ious": frame_meta["pairwise_ious"],
             "purge_events": frame_meta["purge_events"],
             "reinit_events": frame_meta.get("reinit_events", []),
+            "swap_events": frame_meta.get("swap_events", []),
             "yielded_frame_idxs": {
                 int(k): v
                 for k, v in frame_meta.get("yielded_frame_idxs", {}).items()
@@ -135,6 +138,7 @@ def load_diagnostics(path: str) -> list:
 # Object colors: visually distinct, alpha-friendly
 PURGE_COLOR = "red"
 REINIT_COLOR = "lime"
+SWAP_COLOR = "cyan"
 INDICATOR_COLOR = "yellow"
 
 
@@ -181,6 +185,13 @@ class DiagnosticViewer:
         for entry in diagnostics:
             if entry.get("reinit_events"):
                 self.reinit_frames.append(entry["frame_idx"])
+
+        # Find swap frames for quick navigation
+        self.swap_frames = []
+        for entry in diagnostics:
+            swap_evts = entry.get("swap_events", [])
+            if any(e.get("action") == "swap" for e in swap_evts):
+                self.swap_frames.append(entry["frame_idx"])
 
         # Precompute timelines
         self._build_timelines()
@@ -358,6 +369,18 @@ class DiagnosticViewer:
                 name="reinit_markers",
             )
 
+        # Swap event markers
+        if self.swap_frames:
+            swap_x = np.array(self.swap_frames, dtype=np.float32)
+            swap_y = np.ones_like(swap_x) * 0.9
+            fig["iou"].add_scatter(
+                np.column_stack([swap_x, swap_y, np.zeros_like(swap_x)]),
+                colors=SWAP_COLOR,
+                sizes=18,
+                markers="square",
+                name="swap_markers",
+            )
+
         # Frame indicator on IoU
         iou_indicator = fig["iou"].add_line(
             np.array([[0, 0, 0], [0, 1, 0]], dtype=np.float32),
@@ -421,7 +444,12 @@ class DiagnosticViewer:
             if entry.get("reinit_events"):
                 objs = ", ".join([str(e["obj_id"]) for e in entry["reinit_events"]])
                 reinit_note = f"  REINIT obj {objs}"
-            frame_text.text = f"Frame: {new_idx} / {self.n_frames - 1}{purge_note}{reinit_note}"
+            swap_note = ""
+            for se in entry.get("swap_events", []):
+                if se.get("action") == "swap":
+                    a, b = se["obj_pair"]
+                    swap_note += f"  SWAP: {a}<->{b}"
+            frame_text.text = f"Frame: {new_idx} / {self.n_frames - 1}{purge_note}{reinit_note}{swap_note}"
 
             # Update indicator lines on timelines
             fx = float(new_idx)
@@ -466,6 +494,15 @@ class DiagnosticViewer:
                 # Wrap around
                 if self.reinit_frames:
                     _update_display(self.reinit_frames[0])
+            elif key == "s":
+                # Jump to next swap event
+                for sf in self.swap_frames:
+                    if sf > idx:
+                        _update_display(sf)
+                        return
+                # Wrap around
+                if self.swap_frames:
+                    _update_display(self.swap_frames[0])
 
         # Register keyboard handler
         fig.renderer.add_event_handler(_on_key, "key_down")
@@ -598,6 +635,19 @@ class DiagnosticViewer:
                     colors=REINIT_COLOR, thickness=1,
                 )
 
+        # Swap markers
+        if self.swap_frames:
+            swap_x = np.array(self.swap_frames, dtype=np.float32)
+            fig["iou"].add_scatter(
+                np.column_stack([swap_x, np.full_like(swap_x, 0.9), np.zeros_like(swap_x)]),
+                colors=SWAP_COLOR, sizes=14, markers="square", name="swap_markers",
+            )
+            for sf in self.swap_frames:
+                fig["iou"].add_line(
+                    np.array([[sf, -0.05, 0], [sf, 1.05, 0]], dtype=np.float32),
+                    colors=SWAP_COLOR, thickness=1,
+                )
+
         self._r_iou_indicator = fig["iou"].add_line(
             np.array([[0, -0.05, 0], [0, 1.05, 0]], dtype=np.float32),
             colors="yellow", thickness=2, name="iou_indicator",
@@ -667,7 +717,12 @@ class DiagnosticViewer:
         if entry.get("reinit_events"):
             objs = ", ".join([str(e["obj_id"]) for e in entry["reinit_events"]])
             reinit_note = f"  REINIT obj {objs}"
-        self._r_frame_text.text = f"Frame {idx} / {self.n_frames - 1}{purge_note}{reinit_note}"
+        swap_note = ""
+        for se in entry.get("swap_events", []):
+            if se.get("action") == "swap":
+                a, b = se["obj_pair"]
+                swap_note += f"  SWAP: {a}<->{b}"
+        self._r_frame_text.text = f"Frame {idx} / {self.n_frames - 1}{purge_note}{reinit_note}{swap_note}"
 
         # Frame indicators on timelines
         self._r_score_indicator.data = np.array(

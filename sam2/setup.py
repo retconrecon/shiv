@@ -49,6 +49,9 @@ EXTRA_PACKAGES = {
         "pycocotools>=2.0.8",
         "strawberry-graphql>=0.243.0",
     ],
+    "identity": [
+        "transformers>=4.56.0",
+    ],
     "dev": [
         "black==24.2.0",
         "usort==1.0.2",

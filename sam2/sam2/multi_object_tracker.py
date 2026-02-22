@@ -32,7 +32,10 @@ import gc
 import logging
 import os
 import os.path as osp
-from typing import Callable, Dict, Generator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from sam2.identity_verifier import IdentityVerifier
 
 import cv2
 import numpy as np
@@ -215,6 +218,7 @@ class MultiObjectTracker:
         capture_diagnostics: bool = False,
         health_check: Optional[Callable] = None,
         health_check_interval: int = 30,
+        identity_verifier: Optional["IdentityVerifier"] = None,
     ) -> Generator[Tuple[int, Dict[int, np.ndarray], List[dict]], None, None]:
         """
         Run lockstep multi-object tracking with Cross-Object Interaction.
@@ -244,6 +248,9 @@ class MultiObjectTracker:
             Return ``{}`` when all trackers are healthy.
         health_check_interval : int
             Run the health check every N frames (default 30).
+        identity_verifier : IdentityVerifier, optional
+            If provided, monitors crossing events and detects identity swaps
+            by comparing visual embeddings before and after crossings.
 
         Yields
         ------
@@ -267,10 +274,11 @@ class MultiObjectTracker:
             return
 
         self.reinit_events = []
+        self.swap_events = []
 
         # Pre-load sorted frame file paths (needed for diagnostics and health check)
         _frame_files = None
-        if capture_diagnostics or health_check is not None:
+        if capture_diagnostics or health_check is not None or identity_verifier is not None:
             _exts = (".jpg", ".jpeg", ".png", ".bmp")
             _frame_files = sorted([
                 osp.join(video_dir, f)
@@ -323,6 +331,8 @@ class MultiObjectTracker:
                         frame_idx, _obj_ids, video_res_masks = next(generators[oid])
                     except StopIteration:
                         exhausted.add(oid)
+                        if identity_verifier is not None:
+                            identity_verifier.reset_object(oid)
                         continue
                     except Exception as e:
                         logging.error(
@@ -330,6 +340,8 @@ class MultiObjectTracker:
                             oid, type(e).__name__, e,
                         )
                         exhausted.add(oid)
+                        if identity_verifier is not None:
+                            identity_verifier.reset_object(oid)
                         try:
                             generators[oid].close()
                         except Exception:
@@ -403,6 +415,89 @@ class MultiObjectTracker:
                             "purged": n_purged,
                         })
 
+                # --- Consolidated frame load ---
+                _frame_bgr = None
+                _need_frame = (
+                    identity_verifier is not None
+                    or capture_diagnostics
+                    or (health_check is not None
+                        and current_frame_idx > 0
+                        and current_frame_idx % health_check_interval == 0)
+                )
+                if _frame_files is not None and _need_frame:
+                    _frame_bgr = cv2.imread(_frame_files[current_frame_idx])
+
+                # --- Identity Verification ---
+                swap_events = []
+                if identity_verifier is not None:
+                    # Reset pair states for CoI purge victims (P1: CoI-mid)
+                    for pe in purge_events:
+                        identity_verifier.reset_object(pe["purged_obj"])
+
+                    swap_events = identity_verifier.update(
+                        frame_idx=current_frame_idx,
+                        pairwise_ious=pairwise_ious,
+                        bool_masks=bool_masks,
+                        frame_bgr=_frame_bgr,
+                    )
+
+                    # Resolve conflicting swaps: highest margin wins (S3)
+                    actual_swaps = [
+                        e for e in swap_events if e["action"] == "swap"
+                    ]
+                    if len(actual_swaps) > 1:
+                        actual_swaps.sort(
+                            key=lambda e: e["margin"], reverse=True,
+                        )
+                        claimed_oids = set()
+                        for event in actual_swaps:
+                            a, b = event["obj_pair"]
+                            if a in claimed_oids or b in claimed_oids:
+                                logging.warning(
+                                    "Deferring conflicting swap %s at "
+                                    "frame %d (oid already claimed)",
+                                    event["obj_pair"], current_frame_idx,
+                                )
+                                event["action"] = "deferred"
+                            else:
+                                claimed_oids.add(a)
+                                claimed_oids.add(b)
+
+                    # Apply non-conflicting swaps
+                    for event in swap_events:
+                        if event["action"] == "swap":
+                            oid_a, oid_b = event["obj_pair"]
+                            logging.info(
+                                "SWAP DETECTED frame %d: oid %d <-> %d "
+                                "(margin=%.4f)",
+                                current_frame_idx, oid_a, oid_b,
+                                event["margin"],
+                            )
+                            # Atomic relabel
+                            predictors[oid_a], predictors[oid_b] = (
+                                predictors[oid_b], predictors[oid_a])
+                            states[oid_a], states[oid_b] = (
+                                states[oid_b], states[oid_a])
+                            generators[oid_a], generators[oid_b] = (
+                                generators[oid_b], generators[oid_a])
+                            frame_masks[oid_a], frame_masks[oid_b] = (
+                                frame_masks[oid_b], frame_masks[oid_a])
+                            frame_outputs[oid_a], frame_outputs[oid_b] = (
+                                frame_outputs[oid_b], frame_outputs[oid_a])
+                            bool_masks[oid_a], bool_masks[oid_b] = (
+                                bool_masks[oid_b], bool_masks[oid_a])
+                            # Swap exhausted status (P0: L1.3)
+                            if oid_a in exhausted and oid_b not in exhausted:
+                                exhausted.discard(oid_a)
+                                exhausted.add(oid_b)
+                            elif oid_b in exhausted and oid_a not in exhausted:
+                                exhausted.discard(oid_b)
+                                exhausted.add(oid_a)
+                            # Invalidate sibling pair states (P1: S2)
+                            identity_verifier.notify_swap(oid_a, oid_b)
+
+                self.swap_events.extend(swap_events)
+
                 # Snapshot KF states before re-init may swap predictors
                 pre_reinit_kf = {
                     oid: _get_kf_state(predictors[oid])
@@ -415,13 +510,12 @@ class MultiObjectTracker:
                         and current_frame_idx > 0
                         and current_frame_idx % health_check_interval == 0):
                     try:
-                        hc_frame = cv2.imread(_frame_files[current_frame_idx])
                         reinit_boxes = health_check(
                             current_frame_idx,
                             frame_masks,
                             {oid: _get_score(frame_outputs[oid])
                              for oid in active_ids},
-                            hc_frame,
+                            _frame_bgr,
                         )
                     except Exception as e:
                         logging.warning(
@@ -483,6 +577,10 @@ class MultiObjectTracker:
                             gc.collect()
                             torch.cuda.empty_cache()
 
+                            # Reset verifier pair states (P1: S4)
+                            if identity_verifier is not None:
+                                identity_verifier.reset_object(oid)
+
                             reinit_events.append({
                                 "frame_idx": current_frame_idx,
                                 "obj_id": oid,
@@ -504,11 +602,9 @@ class MultiObjectTracker:
 
                 # --- Capture diagnostics ---
                 if capture_diagnostics:
-                    # Bake video frame + mask overlays into a self-contained composite
-                    frame_bgr = cv2.imread(_frame_files[current_frame_idx])
                     composite = _bake_composite(
-                        frame_bgr, frame_masks, obj_ids,
-                    ) if frame_bgr is not None else None
+                        _frame_bgr, frame_masks, obj_ids,
+                    ) if _frame_bgr is not None else None
 
                     diag_entry = {
                         "frame_idx": current_frame_idx,
@@ -535,6 +631,7 @@ class MultiObjectTracker:
                         },
                         "purge_events": purge_events,
                         "reinit_events": reinit_events,
+                        "swap_events": swap_events,
                         "yielded_frame_idxs": dict(yielded_frame_idxs),
                     }
                     self.diagnostics.append(diag_entry)
