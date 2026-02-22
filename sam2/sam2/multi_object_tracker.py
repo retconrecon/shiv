@@ -265,7 +265,7 @@ class MultiObjectTracker:
             - obj_pair: (int, int) — the two colliding object IDs
             - iou: float — their mask IoU
             - scores: (float, float) — confidence scores for the pair
-            - purged_obj: int — which object's memory was purged
+            - purged_obj: "both" — both objects' memory is purged during overlap
             - purged: int — number of memory entries removed
         """
         obj_ids = sorted(init_boxes.keys())
@@ -397,22 +397,18 @@ class MultiObjectTracker:
                         score_a = _get_score(frame_outputs[oid_a])
                         score_b = _get_score(frame_outputs[oid_b])
 
-                        if score_a <= score_b:
-                            victim_oid = oid_a
-                        else:
-                            victim_oid = oid_b
-
-                        n_purged = _purge_memory(
-                            states[victim_oid], current_frame_idx,
-                        )
+                        # Freeze both: purge both trackers' memory during overlap
+                        # to prevent contaminated memory from causing identity swaps
+                        n_purged_a = _purge_memory(states[oid_a], current_frame_idx)
+                        n_purged_b = _purge_memory(states[oid_b], current_frame_idx)
 
                         purge_events.append({
                             "frame_idx": current_frame_idx,
                             "obj_pair": (oid_a, oid_b),
                             "iou": iou,
                             "scores": (score_a, score_b),
-                            "purged_obj": victim_oid,
-                            "purged": n_purged,
+                            "purged_obj": "both",
+                            "purged": n_purged_a + n_purged_b,
                         })
 
                 # --- Consolidated frame load ---
@@ -432,7 +428,8 @@ class MultiObjectTracker:
                 if identity_verifier is not None:
                     # Reset pair states for CoI purge victims (P1: CoI-mid)
                     for pe in purge_events:
-                        identity_verifier.reset_object(pe["purged_obj"])
+                        for oid in pe["obj_pair"]:
+                            identity_verifier.reset_object(oid)
 
                     swap_events = identity_verifier.update(
                         frame_idx=current_frame_idx,
