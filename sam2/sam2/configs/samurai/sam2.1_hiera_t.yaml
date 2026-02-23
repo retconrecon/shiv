@@ -128,3 +128,5 @@ model:
   memory_bank_iou_threshold: 0.5
   memory_bank_obj_score_threshold: 0.0
   memory_bank_kf_score_threshold: 0.0
+  memory_write_iou_threshold: 0.5
+  max_non_cond_frames: 64

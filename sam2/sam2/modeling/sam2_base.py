@@ -107,6 +107,12 @@ class SAM2Base(torch.nn.Module):
         memory_bank_iou_threshold: float = 0.5,
         memory_bank_obj_score_threshold: float = 0.0,
         memory_bank_kf_score_threshold: float = 0.0,
+        # Score-gated memory writes (DAM4SAM-inspired): skip memory encoding
+        # when predicted IoU is below this threshold. 0.0 = disabled (write all frames).
+        memory_write_iou_threshold: float = 0.0,
+        # Memory bank cap: max non-conditioning frames to retain.
+        # -1 = unlimited (original behavior). Oldest frames evicted first (FIFO).
+        max_non_cond_frames: int = -1,
     ):
         super().__init__()
 
@@ -216,6 +222,8 @@ class SAM2Base(torch.nn.Module):
         self.memory_bank_iou_threshold = memory_bank_iou_threshold
         self.memory_bank_obj_score_threshold = memory_bank_obj_score_threshold
         self.memory_bank_kf_score_threshold = memory_bank_kf_score_threshold
+        self.memory_write_iou_threshold = memory_write_iou_threshold
+        self.max_non_cond_frames = max_non_cond_frames
 
         print(f"\033[93mSAMURAI mode: {self.samurai_mode}\033[0m")
 
@@ -723,6 +731,9 @@ class SAM2Base(torch.nn.Module):
             for t_pos, prev in t_pos_and_prevs:
                 if prev is None:
                     continue  # skip padding frames
+                # Skip frames whose memory was gated out (score below write threshold)
+                if prev["maskmem_features"] is None:
+                    continue
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
@@ -1018,6 +1029,15 @@ class SAM2Base(torch.nn.Module):
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
             current_out["object_score_logits"] = object_score_logits
+
+        # Score-gated memory writes (DAM4SAM-inspired):
+        # Skip memory encoding for low-quality predictions to keep memory bank clean.
+        if run_mem_encoder and self.memory_write_iou_threshold > 0:
+            _score = best_iou_score
+            if isinstance(_score, torch.Tensor):
+                _score = _score.item()
+            if _score < self.memory_write_iou_threshold:
+                run_mem_encoder = False
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)

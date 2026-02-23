@@ -32,6 +32,7 @@ import gc
 import logging
 import os
 import os.path as osp
+from collections import deque
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -265,7 +266,10 @@ class MultiObjectTracker:
             - obj_pair: (int, int) — the two colliding object IDs
             - iou: float — their mask IoU
             - scores: (float, float) — confidence scores for the pair
-            - purged_obj: "both" — both objects' memory is purged during overlap
+            - purged_obj: int or "both" — which object's memory was purged
+              (int = variance-based single victim, "both" = freeze-both fallback)
+            - variances: (float, float) — score variance over last 10 frames
+            - var_ratio: float — max/min variance ratio (>= 2.0 = discriminative)
             - purged: int — number of memory entries removed
         """
         obj_ids = sorted(init_boxes.keys())
@@ -315,6 +319,10 @@ class MultiObjectTracker:
                 states[oid] = state
                 generators[oid] = pred.propagate_in_video(state)
 
+            # Score history for variance-based CoI victim selection (SAM2MOT-inspired)
+            _VARIANCE_WINDOW = 10
+            score_history = {oid: deque(maxlen=_VARIANCE_WINDOW) for oid in obj_ids}
+
             # Step all generators in lockstep
             exhausted = set()
             try:
@@ -358,6 +366,7 @@ class MultiObjectTracker:
                     if current_out is None:
                         current_out = out_dict["cond_frame_outputs"].get(frame_idx, {})
                     frame_outputs[oid] = current_out
+                    score_history[oid].append(_get_score(current_out))
 
                 if not frame_masks:
                     break
@@ -397,18 +406,39 @@ class MultiObjectTracker:
                         score_a = _get_score(frame_outputs[oid_a])
                         score_b = _get_score(frame_outputs[oid_b])
 
-                        # Freeze both: purge both trackers' memory during overlap
-                        # to prevent contaminated memory from causing identity swaps
-                        n_purged_a = _purge_memory(states[oid_a], current_frame_idx)
-                        n_purged_b = _purge_memory(states[oid_b], current_frame_idx)
+                        # Variance-based victim selection (SAM2MOT-inspired)
+                        # High variance = score dropped abruptly = occluded victim
+                        # Low variance = gradual degradation = occluder
+                        var_a = float(np.var(score_history[oid_a])) if len(score_history[oid_a]) >= 2 else 0.0
+                        var_b = float(np.var(score_history[oid_b])) if len(score_history[oid_b]) >= 2 else 0.0
+
+                        min_var = min(var_a, var_b)
+                        max_var = max(var_a, var_b)
+                        var_ratio = max_var / min_var if min_var > 1e-8 else float('inf')
+
+                        _VAR_RATIO_THRESH = 2.0
+
+                        if var_ratio >= _VAR_RATIO_THRESH:
+                            # Variance is discriminative — purge only the victim
+                            victim_oid = oid_a if var_a > var_b else oid_b
+                            n_purged = _purge_memory(states[victim_oid], current_frame_idx)
+                            purged_label = victim_oid
+                        else:
+                            # Variances too close — freeze both (fallback)
+                            n_purged_a = _purge_memory(states[oid_a], current_frame_idx)
+                            n_purged_b = _purge_memory(states[oid_b], current_frame_idx)
+                            n_purged = n_purged_a + n_purged_b
+                            purged_label = "both"
 
                         purge_events.append({
                             "frame_idx": current_frame_idx,
                             "obj_pair": (oid_a, oid_b),
                             "iou": iou,
                             "scores": (score_a, score_b),
-                            "purged_obj": "both",
-                            "purged": n_purged_a + n_purged_b,
+                            "variances": (var_a, var_b),
+                            "var_ratio": var_ratio,
+                            "purged_obj": purged_label,
+                            "purged": n_purged,
                         })
 
                 # --- Consolidated frame load ---
@@ -483,6 +513,8 @@ class MultiObjectTracker:
                                 frame_outputs[oid_b], frame_outputs[oid_a])
                             bool_masks[oid_a], bool_masks[oid_b] = (
                                 bool_masks[oid_b], bool_masks[oid_a])
+                            score_history[oid_a], score_history[oid_b] = (
+                                score_history[oid_b], score_history[oid_a])
                             # Swap exhausted status (P0: L1.3)
                             if oid_a in exhausted and oid_b not in exhausted:
                                 exhausted.discard(oid_a)
@@ -573,6 +605,9 @@ class MultiObjectTracker:
                             del old_gen
                             gc.collect()
                             torch.cuda.empty_cache()
+
+                            # Reset score history after re-init
+                            score_history[oid] = deque(maxlen=_VARIANCE_WINDOW)
 
                             # Reset verifier pair states (P1: S4)
                             if identity_verifier is not None:

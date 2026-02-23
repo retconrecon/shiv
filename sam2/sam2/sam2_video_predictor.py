@@ -730,6 +730,11 @@ class SAM2VideoPredictor(SAM2Base):
                     run_mem_encoder=True,
                 )
                 output_dict[storage_key][frame_idx] = current_out
+                if (
+                    storage_key == "non_cond_frame_outputs"
+                    and self.max_non_cond_frames > 0
+                ):
+                    self._enforce_memory_cap(inference_state, frame_idx, reverse)
             # Create slices of per-object outputs for subsequent interaction with each
             # individual object after tracking.
             self._add_output_per_object(
@@ -1155,6 +1160,21 @@ class SAM2VideoPredictor(SAM2Base):
                 updated_frames.append((frame_idx, video_res_masks))
 
         return inference_state["obj_ids"], updated_frames
+
+    def _enforce_memory_cap(self, inference_state, current_frame_idx, reverse):
+        """Evict oldest non-conditioning frames when memory bank exceeds cap."""
+        output_dict = inference_state["output_dict"]
+        non_cond = output_dict["non_cond_frame_outputs"]
+        while len(non_cond) > self.max_non_cond_frames:
+            # Evict frame furthest from current position
+            if not reverse:
+                victim = min(non_cond)
+            else:
+                victim = max(non_cond)
+            del non_cond[victim]
+            # Also remove from per-object dicts
+            for obj_output_dict in inference_state["output_dict_per_obj"].values():
+                obj_output_dict["non_cond_frame_outputs"].pop(victim, None)
 
     def _clear_non_cond_mem_around_input(self, inference_state, frame_idx):
         """

@@ -256,7 +256,8 @@ class DiagnosticViewer:
         import fastplotlib as fpl
 
         # --- Build figure ---
-        fig = fpl.Figure(
+        _make = getattr(fpl, "Figure", None) or fpl.GridPlot
+        fig = _make(
             shape=(2, 2),
             size=(1400, 800),
             names=[
