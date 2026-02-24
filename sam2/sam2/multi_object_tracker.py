@@ -33,6 +33,8 @@ import logging
 import os
 import os.path as osp
 from collections import deque
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -44,6 +46,31 @@ import torch
 
 from sam2.build_sam import build_sam2_video_predictor
 from sam2.diagnostics import save_diagnostics, load_diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Track State Machine
+# ---------------------------------------------------------------------------
+
+class TrackTier(str, Enum):
+    RELIABLE = "reliable"      # logits > 8.0
+    PENDING = "pending"        # 6.0 < logits <= 8.0
+    SUSPICIOUS = "suspicious"  # 2.0 < logits <= 6.0
+    LOST = "lost"              # logits <= 2.0
+
+
+# Ordered from best to worst for comparison
+_TIER_ORDER = [TrackTier.RELIABLE, TrackTier.PENDING, TrackTier.SUSPICIOUS, TrackTier.LOST]
+_TIER_RANK = {t: i for i, t in enumerate(_TIER_ORDER)}
+
+
+@dataclass
+class TrackState:
+    tier: TrackTier = TrackTier.RELIABLE
+    frames_in_tier: int = 0
+    lost_counter: int = 0          # consecutive frames in Lost (for death)
+    recovery_counter: int = 0      # consecutive frames above current tier (for hysteresis)
+    last_logits: float = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +156,90 @@ def _get_scores_dict(current_out: dict) -> Dict[str, float]:
         "obj": _to_float(current_out.get("object_score_logits")),
         "kf": _to_float(current_out.get("kf_score")),
     }
+
+
+def _get_obj_logits(current_out: dict) -> float:
+    """
+    Extract ``object_score_logits`` as a Python float.
+
+    Handles tensors (normal path), literal ints (``_use_mask_as_output``
+    fallback where score=1), and None (missing key).  Returns 10.0 as
+    default — conditioning frames emit +10.0, which maps to Reliable.
+    """
+    v = current_out.get("object_score_logits")
+    if v is None:
+        return 10.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    return float(v.item())
+
+
+def _compute_tier(
+    logits: float,
+    thresholds: Dict[str, float],
+) -> TrackTier:
+    """Classify *logits* into a tier using *thresholds*."""
+    if logits > thresholds["reliable"]:
+        return TrackTier.RELIABLE
+    if logits > thresholds["pending"]:
+        return TrackTier.PENDING
+    if logits > thresholds["suspicious"]:
+        return TrackTier.SUSPICIOUS
+    return TrackTier.LOST
+
+
+def _update_track_state(
+    ts: TrackState,
+    logits: float,
+    thresholds: Dict[str, float],
+    recovery_frames: int = 3,
+) -> Optional[Tuple[TrackTier, TrackTier]]:
+    """
+    Update *ts* in-place and return ``(from_tier, to_tier)`` on transition.
+
+    - **Degradation** (toward Lost): immediate.
+    - **Recovery** (toward Reliable): requires *recovery_frames* consecutive
+      frames classified above the current tier.
+    """
+    ts.last_logits = logits
+    new_tier = _compute_tier(logits, thresholds)
+
+    old_rank = _TIER_RANK[ts.tier]
+    new_rank = _TIER_RANK[new_tier]
+
+    if new_rank > old_rank:
+        # Degradation — immediate
+        from_tier = ts.tier
+        ts.tier = new_tier
+        ts.frames_in_tier = 1
+        ts.recovery_counter = 0
+        if new_tier == TrackTier.LOST:
+            ts.lost_counter += 1
+        else:
+            ts.lost_counter = 0
+        return (from_tier, new_tier)
+
+    if new_rank < old_rank:
+        # Candidate for recovery — require hysteresis
+        ts.recovery_counter += 1
+        ts.frames_in_tier += 1
+        ts.lost_counter = 0
+        if ts.recovery_counter >= recovery_frames:
+            from_tier = ts.tier
+            ts.tier = new_tier
+            ts.frames_in_tier = 1
+            ts.recovery_counter = 0
+            return (from_tier, new_tier)
+        return None
+
+    # Same tier
+    ts.frames_in_tier += 1
+    ts.recovery_counter = 0
+    if ts.tier == TrackTier.LOST:
+        ts.lost_counter += 1
+    else:
+        ts.lost_counter = 0
+    return None
 
 
 def _bake_composite(frame_bgr: np.ndarray, masks: dict, obj_ids: list) -> np.ndarray:
@@ -220,6 +331,11 @@ class MultiObjectTracker:
         health_check: Optional[Callable] = None,
         health_check_interval: int = 30,
         identity_verifier: Optional["IdentityVerifier"] = None,
+        tier_thresholds: Optional[Dict[str, float]] = None,
+        tier_recovery_frames: int = 3,
+        lost_tolerance: int = 25,
+        event_driven_health_check: bool = True,
+        event_health_check_cooldown: int = 15,
     ) -> Generator[Tuple[int, Dict[int, np.ndarray], List[dict]], None, None]:
         """
         Run lockstep multi-object tracking with Cross-Object Interaction.
@@ -252,6 +368,18 @@ class MultiObjectTracker:
         identity_verifier : IdentityVerifier, optional
             If provided, monitors crossing events and detects identity swaps
             by comparing visual embeddings before and after crossings.
+        tier_thresholds : dict, optional
+            Logit thresholds for track tiers: ``{"reliable": 8.0, "pending":
+            6.0, "suspicious": 2.0}``.  Defaults provided if None.
+        tier_recovery_frames : int
+            Consecutive frames above current tier required for promotion.
+        lost_tolerance : int
+            Consecutive Lost-tier frames before a track is killed.
+        event_driven_health_check : bool
+            If True, trigger an extra health check when any object enters
+            the Pending tier (subject to cooldown).
+        event_health_check_cooldown : int
+            Minimum frames between event-driven health checks.
 
         Yields
         ------
@@ -323,6 +451,15 @@ class MultiObjectTracker:
             _VARIANCE_WINDOW = 10
             score_history = {oid: deque(maxlen=_VARIANCE_WINDOW) for oid in obj_ids}
 
+            # Track state machine (4a)
+            _tier_thresholds = tier_thresholds or {
+                "reliable": 8.0, "pending": 6.0, "suspicious": 2.0,
+            }
+            track_states: Dict[int, TrackState] = {
+                oid: TrackState() for oid in obj_ids
+            }
+            _last_health_check_frame = -999
+
             # Step all generators in lockstep
             exhausted = set()
             try:
@@ -386,6 +523,56 @@ class MultiObjectTracker:
                         f"frame_idxs: {yielded_frame_idxs}"
                     )
 
+                # --- Track state update (4b) ---
+                state_transitions = []
+                pending_oids = []
+                dead_oids = []
+                for oid in list(frame_masks.keys()):
+                    if oid not in track_states:
+                        continue
+                    logits = _get_obj_logits(frame_outputs[oid])
+                    transition = _update_track_state(
+                        track_states[oid], logits,
+                        _tier_thresholds, tier_recovery_frames,
+                    )
+                    if transition is not None:
+                        state_transitions.append({
+                            "obj_id": oid,
+                            "from": transition[0].value,
+                            "to": transition[1].value,
+                            "logits": logits,
+                        })
+                    ts = track_states[oid]
+                    if ts.tier == TrackTier.PENDING:
+                        pending_oids.append(oid)
+                    if ts.lost_counter >= lost_tolerance:
+                        dead_oids.append(oid)
+
+                # --- Track death (4c) ---
+                track_death_events = []
+                for oid in dead_oids:
+                    logging.warning(
+                        "TRACK DEATH oid=%d at frame %d "
+                        "(lost_counter=%d >= tolerance=%d)",
+                        oid, current_frame_idx,
+                        track_states[oid].lost_counter, lost_tolerance,
+                    )
+                    try:
+                        generators[oid].close()
+                    except Exception:
+                        pass
+                    exhausted.add(oid)
+                    del track_states[oid]
+                    score_history[oid] = deque(maxlen=_VARIANCE_WINDOW)
+                    if identity_verifier is not None:
+                        identity_verifier.reset_object(oid)
+                    frame_masks.pop(oid, None)
+                    frame_outputs.pop(oid, None)
+                    track_death_events.append({
+                        "frame_idx": current_frame_idx,
+                        "obj_id": oid,
+                    })
+
                 # --- Cross-Object Interaction ---
                 purge_events = []
                 active_ids = list(frame_masks.keys())
@@ -441,17 +628,19 @@ class MultiObjectTracker:
                             "purged": n_purged,
                         })
 
-                # --- Consolidated frame load ---
-                _frame_bgr = None
-                _need_frame = (
-                    identity_verifier is not None
-                    or capture_diagnostics
-                    or (health_check is not None
-                        and current_frame_idx > 0
-                        and current_frame_idx % health_check_interval == 0)
-                )
-                if _frame_files is not None and _need_frame:
-                    _frame_bgr = cv2.imread(_frame_files[current_frame_idx])
+                # --- Lazy frame load (4d) ---
+                _frame_bgr_cache = [None]  # mutable box for closure
+
+                def _load_frame():
+                    if _frame_bgr_cache[0] is None and _frame_files is not None:
+                        _frame_bgr_cache[0] = cv2.imread(
+                            _frame_files[current_frame_idx],
+                        )
+                    return _frame_bgr_cache[0]
+
+                # Eagerly load for always-on consumers
+                if identity_verifier is not None or capture_diagnostics:
+                    _load_frame()
 
                 # --- Identity Verification ---
                 swap_events = []
@@ -465,7 +654,7 @@ class MultiObjectTracker:
                         frame_idx=current_frame_idx,
                         pairwise_ious=pairwise_ious,
                         bool_masks=bool_masks,
-                        frame_bgr=_frame_bgr,
+                        frame_bgr=_load_frame(),
                     )
 
                     # Resolve conflicting swaps: highest margin wins (S3)
@@ -515,6 +704,10 @@ class MultiObjectTracker:
                                 bool_masks[oid_b], bool_masks[oid_a])
                             score_history[oid_a], score_history[oid_b] = (
                                 score_history[oid_b], score_history[oid_a])
+                            # Swap track states (4g)
+                            if oid_a in track_states and oid_b in track_states:
+                                track_states[oid_a], track_states[oid_b] = (
+                                    track_states[oid_b], track_states[oid_a])
                             # Swap exhausted status (P0: L1.3)
                             if oid_a in exhausted and oid_b not in exhausted:
                                 exhausted.discard(oid_a)
@@ -533,18 +726,27 @@ class MultiObjectTracker:
                     for oid in active_ids
                 }
 
-                # --- Health check & re-initialization ---
+                # --- Health check & re-initialization (4e) ---
                 reinit_events = []
-                if (health_check is not None
-                        and current_frame_idx > 0
-                        and current_frame_idx % health_check_interval == 0):
+                _interval_trigger = (
+                    current_frame_idx > 0
+                    and current_frame_idx % health_check_interval == 0
+                )
+                _event_trigger = (
+                    event_driven_health_check
+                    and pending_oids
+                    and (current_frame_idx - _last_health_check_frame)
+                    >= event_health_check_cooldown
+                )
+                if health_check is not None and (_interval_trigger or _event_trigger):
+                    _last_health_check_frame = current_frame_idx
                     try:
                         reinit_boxes = health_check(
                             current_frame_idx,
                             frame_masks,
                             {oid: _get_score(frame_outputs[oid])
                              for oid in active_ids},
-                            _frame_bgr,
+                            _load_frame(),
                         )
                     except Exception as e:
                         logging.warning(
@@ -569,6 +771,11 @@ class MultiObjectTracker:
                             continue
 
                         if current_frame_idx >= num_frames - 2:
+                            continue
+
+                        # Gate re-init by tier (4f): Reliable tracks don't need it
+                        ts = track_states.get(oid)
+                        if ts is not None and ts.tier == TrackTier.RELIABLE:
                             continue
 
                         try:
@@ -606,8 +813,9 @@ class MultiObjectTracker:
                             gc.collect()
                             torch.cuda.empty_cache()
 
-                            # Reset score history after re-init
+                            # Reset score history and track state after re-init
                             score_history[oid] = deque(maxlen=_VARIANCE_WINDOW)
+                            track_states[oid] = TrackState()
 
                             # Reset verifier pair states (P1: S4)
                             if identity_verifier is not None:
@@ -634,9 +842,10 @@ class MultiObjectTracker:
 
                 # --- Capture diagnostics ---
                 if capture_diagnostics:
+                    _fbgr = _load_frame()
                     composite = _bake_composite(
-                        _frame_bgr, frame_masks, obj_ids,
-                    ) if _frame_bgr is not None else None
+                        _fbgr, frame_masks, obj_ids,
+                    ) if _fbgr is not None else None
 
                     diag_entry = {
                         "frame_idx": current_frame_idx,
@@ -665,6 +874,18 @@ class MultiObjectTracker:
                         "reinit_events": reinit_events,
                         "swap_events": swap_events,
                         "yielded_frame_idxs": dict(yielded_frame_idxs),
+                        "track_states": {
+                            oid: {
+                                "tier": track_states[oid].tier.value,
+                                "frames_in_tier": track_states[oid].frames_in_tier,
+                                "lost_counter": track_states[oid].lost_counter,
+                                "logits": track_states[oid].last_logits,
+                            }
+                            for oid in active_ids
+                            if oid in track_states
+                        },
+                        "state_transitions": state_transitions,
+                        "track_deaths": track_death_events,
                     }
                     self.diagnostics.append(diag_entry)
 

@@ -62,6 +62,9 @@ def save_diagnostics(diagnostics: list, path: str) -> None:
             "reinit_events": entry.get("reinit_events", []),
             "swap_events": entry.get("swap_events", []),
             "yielded_frame_idxs": entry.get("yielded_frame_idxs", {}),
+            "track_states": entry.get("track_states", {}),
+            "state_transitions": entry.get("state_transitions", []),
+            "track_deaths": entry.get("track_deaths", []),
             "has_composite": False,
         }
         for oid, kf in entry["kf_states"].items():
@@ -116,6 +119,12 @@ def load_diagnostics(path: str) -> list:
                 int(k): v
                 for k, v in frame_meta.get("yielded_frame_idxs", {}).items()
             },
+            "track_states": {
+                int(k): v
+                for k, v in frame_meta.get("track_states", {}).items()
+            },
+            "state_transitions": frame_meta.get("state_transitions", []),
+            "track_deaths": frame_meta.get("track_deaths", []),
             "composite": None,
         }
         for oid_str, has_kf in frame_meta["kf_states"].items():
