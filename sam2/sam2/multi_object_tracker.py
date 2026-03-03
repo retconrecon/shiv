@@ -289,10 +289,11 @@ class MultiObjectTracker:
         if capture_diagnostics:
             self.diagnostics = []
 
-        # Build N independent predictors
+        # Build N independent predictors (share video frames to avoid OOM)
         predictors = {}
         states = {}
         generators = {}
+        preloaded = None  # shared (images, video_height, video_width) tuple
 
         with torch.inference_mode(), torch.autocast(self.device, dtype=torch.float16):
             for oid in obj_ids:
@@ -306,7 +307,10 @@ class MultiObjectTracker:
                     video_dir,
                     offload_video_to_cpu=offload_video_to_cpu,
                     offload_state_to_cpu=offload_state_to_cpu,
+                    preloaded_images=preloaded,
                 )
+                if preloaded is None:
+                    preloaded = (state["images"], state["video_height"], state["video_width"])
                 box = init_boxes[oid]
                 pred.add_new_points_or_box(
                     state, box=box, frame_idx=0, obj_id=0,
@@ -550,6 +554,7 @@ class MultiObjectTracker:
                                 video_dir,
                                 offload_video_to_cpu=offload_video_to_cpu,
                                 offload_state_to_cpu=offload_state_to_cpu,
+                                preloaded_images=preloaded,
                             )
                             new_pred.add_new_points_or_box(
                                 new_state, box=box,
@@ -644,6 +649,7 @@ class MultiObjectTracker:
                 predictors.clear()
                 states.clear()
                 generators.clear()
+                preloaded = None
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
