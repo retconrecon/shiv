@@ -7,6 +7,7 @@
 import warnings
 from collections import OrderedDict
 
+from loguru import logger
 import torch
 
 from tqdm import tqdm
@@ -31,6 +32,12 @@ class SAM2VideoPredictor(SAM2Base):
         # if `add_all_frames_to_correct_as_cond` is True, we also append to the conditioning frame list any frame that receives a later correction click
         # if `add_all_frames_to_correct_as_cond` is False, we conditioning frame list to only use those initial conditioning frames
         add_all_frames_to_correct_as_cond=False,
+        # Memory pruning: sliding window of recent frames with full tensors
+        max_recent_frames=500,
+        # Memory pruning: sparse high-quality landmark frames outside the recent window
+        max_landmark_frames=50,
+        # Memory pruning: only run pruning every N frames
+        memory_pruning_interval=100,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -39,6 +46,9 @@ class SAM2VideoPredictor(SAM2Base):
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
         self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
+        self.max_recent_frames = max_recent_frames
+        self.max_landmark_frames = max_landmark_frames
+        self.memory_pruning_interval = memory_pruning_interval
 
     @torch.inference_mode()
     def init_state(
@@ -91,11 +101,19 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["obj_id_to_idx"] = OrderedDict()
         inference_state["obj_idx_to_id"] = OrderedDict()
         inference_state["obj_ids"] = []
+        # Lightweight score index for memory pruning: stores only per-frame scores
+        # (~24 bytes/frame) so the SAMURAI backward scan can evaluate evicted frames.
+        # INVARIANT: score_index and output_dict["score_index"] are the SAME dict object.
+        # Use .clear() for reset, never reassign.
+        inference_state["score_index"] = {}
         # A storage to hold the model's tracking results and states on each frame
         inference_state["output_dict"] = {
             "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
             "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
         }
+        # Expose score_index via output_dict so sam2_base.py can access it
+        # (same dict object — updates are visible from either reference)
+        inference_state["output_dict"]["score_index"] = inference_state["score_index"]
         # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
         inference_state["output_dict_per_obj"] = {}
         # A temporary storage to hold new outputs when user interact with a frame
@@ -709,10 +727,12 @@ class SAM2VideoPredictor(SAM2Base):
             # that received input clicks or mask). Note that we cannot directly run
             # batched forward on them via `_run_single_frame_inference` because the
             # number of clicks on each object might be different.
+            need_pruning = False
             if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
                 storage_key = "cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
                 pred_masks = current_out["pred_masks"]
+                self._update_score_index(inference_state, frame_idx, current_out)
                 if clear_non_cond_mem:
                     # clear non-conditioning memory of the surrounding frames
                     self._clear_non_cond_mem_around_input(inference_state, frame_idx)
@@ -720,6 +740,7 @@ class SAM2VideoPredictor(SAM2Base):
                 storage_key = "non_cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
                 pred_masks = current_out["pred_masks"]
+                self._update_score_index(inference_state, frame_idx, current_out)
             else:
                 storage_key = "non_cond_frame_outputs"
                 current_out, pred_masks = self._run_single_frame_inference(
@@ -734,11 +755,22 @@ class SAM2VideoPredictor(SAM2Base):
                     run_mem_encoder=True,
                 )
                 output_dict[storage_key][frame_idx] = current_out
+                # Record scores in the lightweight index (survives memory pruning)
+                self._update_score_index(inference_state, frame_idx, current_out)
+                need_pruning = True
             # Create slices of per-object outputs for subsequent interaction with each
             # individual object after tracking.
             self._add_output_per_object(
                 inference_state, frame_idx, current_out, storage_key
             )
+            # Periodic memory pruning to cap memory usage on long videos.
+            # Runs AFTER _add_output_per_object so both output_dict and
+            # output_dict_per_obj are consistent when pruning inspects them.
+            if need_pruning:
+                non_cond = output_dict["non_cond_frame_outputs"]
+                if (frame_idx % self.memory_pruning_interval == 0 or
+                        len(non_cond) > self.max_recent_frames + self.max_landmark_frames + 100):
+                    self._prune_memory_bank(inference_state, frame_idx)
             inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
 
             # Resize the output mask to the original video resolution (we directly use
@@ -776,6 +808,108 @@ class SAM2VideoPredictor(SAM2Base):
             if maskmem_pos_enc is not None:
                 obj_out["maskmem_pos_enc"] = [x[obj_slice] for x in maskmem_pos_enc]
             obj_output_dict[storage_key][frame_idx] = obj_out
+
+    @staticmethod
+    def _to_scalar(val):
+        """Extract a Python float from a tensor, int, or float."""
+        if val is None:
+            return None
+        if hasattr(val, "item"):
+            return val.item()
+        return float(val)
+
+    def _update_score_index(self, inference_state, frame_idx, current_out):
+        """Record lightweight scores for a frame (survives memory pruning)."""
+        inference_state["score_index"][frame_idx] = {
+            "best_iou_score": self._to_scalar(current_out.get("best_iou_score")),
+            "object_score_logits": self._to_scalar(current_out.get("object_score_logits")),
+            "kf_score": self._to_scalar(current_out.get("kf_score")),
+        }
+
+    def _prune_memory_bank(self, inference_state, frame_idx):
+        """Evict old frames from memory bank, keeping recent + high-quality landmarks."""
+        output_dict = inference_state["output_dict"]
+        non_cond = output_dict["non_cond_frame_outputs"]
+        target = self.max_recent_frames + self.max_landmark_frames
+        if len(non_cond) <= target:
+            return
+
+        cond_frames = set(output_dict["cond_frame_outputs"].keys())
+        score_index = inference_state["score_index"]
+        # Use a tighter cutoff to leave room for frames that will be added
+        # before the next pruning cycle, keeping total <= target at all times
+        recent_window = max(0, self.max_recent_frames - self.memory_pruning_interval)
+        recent_cutoff = frame_idx - recent_window
+
+        # Partition into recent (keep) vs old (candidates for eviction)
+        old_frames = []
+        for f in list(non_cond.keys()):
+            if f in cond_frames or f >= recent_cutoff:
+                continue  # keep conditioning frames and recent frames
+            # Score for ranking: use score_index (always available), fall back to frame output
+            scores = score_index.get(f)
+            if scores is not None:
+                iou = scores["best_iou_score"]
+            else:
+                frame_out = non_cond.get(f)
+                iou = self._to_scalar(frame_out["best_iou_score"]) if frame_out else -1.0
+            old_frames.append((iou if iou is not None else -1.0, f))
+
+        if len(old_frames) <= self.max_landmark_frames:
+            return  # not enough old frames to warrant eviction
+
+        # Select landmarks with temporal diversity: pick the best-scoring frame
+        # per temporal bucket rather than the global top-K. This prevents
+        # degenerate landmark sets on static scenes (where all frames score ~1.0
+        # and global top-K would bias toward the oldest insertion-ordered frames).
+        if len(old_frames) > self.max_landmark_frames:
+            frame_indices = [f for _, f in old_frames]
+            f_min, f_max = min(frame_indices), max(frame_indices)
+            bucket_size = max(1, (f_max - f_min + 1) // self.max_landmark_frames)
+            # Best frame per temporal bucket
+            buckets = {}
+            for iou, f in old_frames:
+                bid = (f - f_min) // bucket_size
+                if bid not in buckets or iou > buckets[bid][0]:
+                    buckets[bid] = (iou, f)
+            landmark_set = {f for _, f in buckets.values()}
+            # If fewer buckets than max_landmark_frames, fill remaining with
+            # top-scored frames not already in the set
+            if len(landmark_set) < self.max_landmark_frames:
+                old_frames.sort(key=lambda x: x[0], reverse=True)
+                for iou, f in old_frames:
+                    if f not in landmark_set:
+                        landmark_set.add(f)
+                    if len(landmark_set) >= self.max_landmark_frames:
+                        break
+        else:
+            landmark_set = {f for _, f in old_frames}
+        frames_to_evict = [f for _, f in old_frames if f not in landmark_set]
+
+        for f in frames_to_evict:
+            non_cond.pop(f, None)
+            for obj_output_dict in inference_state["output_dict_per_obj"].values():
+                obj_output_dict["non_cond_frame_outputs"].pop(f, None)
+
+        if __debug__:
+            expected_keys = set(non_cond.keys())
+            for obj_idx, obj_output_dict in inference_state["output_dict_per_obj"].items():
+                obj_keys = set(obj_output_dict["non_cond_frame_outputs"].keys())
+                assert obj_keys == expected_keys, (
+                    f"Dict divergence after pruning at frame {frame_idx}: obj {obj_idx} has "
+                    f"{obj_keys - expected_keys} extra, {expected_keys - obj_keys} missing"
+                )
+
+        logger.debug(
+            "Memory pruning at frame {}: evicted {} frames, retained {} "
+            "(recent={}, landmarks={}, cond={})",
+            frame_idx,
+            len(frames_to_evict),
+            len(non_cond),
+            len(non_cond) - len(landmark_set) - len(cond_frames & set(non_cond.keys())),
+            len(landmark_set & set(non_cond.keys())),
+            len(cond_frames),
+        )
 
     @torch.inference_mode()
     def clear_all_prompts_in_frame(
@@ -875,6 +1009,7 @@ class SAM2VideoPredictor(SAM2Base):
             v["non_cond_frame_outputs"].clear()
         inference_state["output_dict"]["cond_frame_outputs"].clear()
         inference_state["output_dict"]["non_cond_frame_outputs"].clear()
+        inference_state["score_index"].clear()
         inference_state["consolidated_frame_inds"]["cond_frame_outputs"].clear()
         inference_state["consolidated_frame_inds"]["non_cond_frame_outputs"].clear()
         inference_state["tracking_has_started"] = False
@@ -1174,7 +1309,9 @@ class SAM2VideoPredictor(SAM2Base):
         frame_idx_end = frame_idx + r * self.num_maskmem
         output_dict = inference_state["output_dict"]
         non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
+        score_index = inference_state.get("score_index", {})
         for t in range(frame_idx_begin, frame_idx_end + 1):
             non_cond_frame_outputs.pop(t, None)
+            score_index.pop(t, None)
             for obj_output_dict in inference_state["output_dict_per_obj"].values():
                 obj_output_dict["non_cond_frame_outputs"].pop(t, None)

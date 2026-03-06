@@ -32,6 +32,7 @@ import gc
 import logging
 import os
 import os.path as osp
+from collections import deque
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -92,6 +93,10 @@ def _purge_memory(inference_state: dict, frame_idx: int) -> int:
     for obj_idx, obj_output_dict in inference_state["output_dict_per_obj"].items():
         if obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None) is not None:
             removed += 1
+
+    # Keep score_index in sync (memory pruning relies on it)
+    if "score_index" in inference_state:
+        inference_state["score_index"].pop(frame_idx, None)
 
     return removed
 
@@ -287,7 +292,10 @@ class MultiObjectTracker:
             ])
 
         if capture_diagnostics:
-            self.diagnostics = []
+            # Cap at 10,000 entries to prevent OOM on long videos.
+            # At 1024x1024, each composite is ~3 MB, so 10k = ~30 GB.
+            # deque automatically drops oldest entries when maxlen is exceeded.
+            self.diagnostics = deque(maxlen=10000)
 
         # Build N independent predictors (share video frames to avoid OOM)
         predictors = {}

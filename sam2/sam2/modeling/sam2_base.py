@@ -661,22 +661,43 @@ class SAM2Base(torch.nn.Module):
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
 
             if self.samurai_mode:
-                valid_indices = [] 
+                valid_indices = []
+                n_evicted_hits = 0
+                score_index = output_dict.get("score_index", {})
+                non_cond_outputs = output_dict["non_cond_frame_outputs"]
                 if frame_idx > 1:  # Ensure we have previous frames to evaluate
-                    for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
-                        frame_out = output_dict["non_cond_frame_outputs"].get(i)
-                        if frame_out is None:
-                            continue  # Frame may have been purged (e.g. Cross-Object Interaction)
-                        iou_score = frame_out["best_iou_score"]  # Get mask affinity score
-                        obj_score = frame_out["object_score_logits"]  # Get object score
-                        kf_score = frame_out.get("kf_score")  # Get motion score if available
+                    # Bound the scan to avoid O(N) iteration on long videos
+                    max_scan = getattr(self, 'max_recent_frames', 500) + getattr(self, 'max_landmark_frames', 50) * 4
+                    scan_limit = max(1, frame_idx - max_scan)
+                    for i in range(frame_idx - 1, scan_limit, -1):  # Iterate backwards through previous frames
+                        # Check lightweight score index first (survives memory pruning)
+                        scores = score_index.get(i)
+                        if scores is not None:
+                            iou_val = scores["best_iou_score"]
+                            obj_val = scores["object_score_logits"]
+                            kf_val = scores.get("kf_score")
+                        else:
+                            # Fall back to full frame output for unindexed frames
+                            frame_out = non_cond_outputs.get(i)
+                            if frame_out is None:
+                                continue  # Frame not available at all
+                            iou_raw = frame_out["best_iou_score"]
+                            iou_val = iou_raw.item() if hasattr(iou_raw, "item") else float(iou_raw)
+                            obj_raw = frame_out["object_score_logits"]
+                            obj_val = obj_raw.item() if hasattr(obj_raw, "item") else float(obj_raw)
+                            kf_raw = frame_out.get("kf_score")
+                            kf_val = kf_raw.item() if kf_raw is not None and hasattr(kf_raw, "item") else kf_raw
                         # Check if the scores meet the criteria for being a valid index
-                        if iou_score.item() > self.memory_bank_iou_threshold and \
-                           obj_score.item() > self.memory_bank_obj_score_threshold and \
-                           (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
-                            valid_indices.insert(0, i)  
+                        if iou_val is not None and iou_val > self.memory_bank_iou_threshold and \
+                           obj_val is not None and obj_val > self.memory_bank_obj_score_threshold and \
+                           (kf_val is None or kf_val > self.memory_bank_kf_score_threshold):
+                            # Only add if full tensors still available (not evicted by pruning)
+                            if i in non_cond_outputs:
+                                valid_indices.insert(0, i)
+                            else:
+                                n_evicted_hits += 1
                         # Check the number of valid indices
-                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
+                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:
                             break
                 if frame_idx - 1 not in valid_indices: 
                     valid_indices.append(frame_idx - 1)
@@ -762,6 +783,7 @@ class SAM2Base(torch.nn.Module):
                     for t, out in ptr_cond_outputs.items()
                 ]
                 # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
+                n_ptrs_skipped = 0
                 for t_diff in range(1, max_obj_ptrs_in_encoder):
                     t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
                     if t < 0 or (num_frames is not None and t >= num_frames):
@@ -771,6 +793,8 @@ class SAM2Base(torch.nn.Module):
                     )
                     if out is not None:
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+                    elif t >= 0:
+                        n_ptrs_skipped += 1
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
                     pos_list, ptrs_list = zip(*pos_and_ptrs)
